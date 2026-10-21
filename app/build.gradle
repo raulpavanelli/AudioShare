@@ -1,0 +1,26 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.audioshare.probe'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+
+    defaultConfig {
+        applicationId 'com.audioshare.probe'
+        minSdk 23
+        targetSdk 30
+        versionCode 19
+        versionName '0.7.4-linear-music-volume-test'
+    }
+
+    buildTypes {
+        debug {
+            // Uses the standard per-user Android debug key.
+        }
+        release {
+            // No private signing key is stored in this repository.
+            // The resulting release APK must be signed locally before distribution.
+            minifyEnabled false
+        }
+    }
+}
