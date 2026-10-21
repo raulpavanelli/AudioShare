@@ -9,8 +9,8 @@ android {
         applicationId 'com.audioshare.probe'
         minSdk 23
         targetSdk 30
-        versionCode 19
-        versionName '0.7.4-linear-music-volume-test'
+        versionCode 20
+        versionName '1.0.0'
     }
 
     buildTypes {

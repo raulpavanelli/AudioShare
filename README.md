@@ -2,7 +2,7 @@
 
 Aplicativo Android de intercomunicação por voz em uma rede Wi‑Fi local. Um aparelho inicia como **servidor** e os demais entram como **participantes**. O servidor retransmite o áudio dos participantes, e cada aparelho também envia o próprio microfone. O servidor pode ainda reproduzir uma pasta de músicas e transmitir a música aos participantes.
 
-> Projeto experimental. A versão atual é `0.7.4-linear-music-volume-test`, preparada para testes nos aparelhos usados no desenvolvimento (Mi 9T Pro e Samsung Galaxy S24 Ultra). Ainda não é uma versão pronta para publicação na Play Store.
+> Projeto experimental. A versão `1.0.0` é uma versão de teste para instalação direta (sideload), validada nos aparelhos usados no desenvolvimento (Mi 9T Pro e Samsung Galaxy S24 Ultra). Ainda não está preparada para publicação na Play Store.
 
 ## O que o app faz
 
