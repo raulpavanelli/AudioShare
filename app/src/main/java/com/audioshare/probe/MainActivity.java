@@ -33,12 +33,21 @@ import android.widget.SeekBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import org.json.JSONObject;
 
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -47,6 +56,8 @@ import java.util.concurrent.Executors;
 public class MainActivity extends Activity {
     private static final int REQ_MIC = 41;
     private static final int REQ_MUSIC_FOLDER = 44;
+    private static final long UPDATE_CHECK_INTERVAL_MS = 24L * 60L * 60L * 1000L;
+    private static final String GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/raulpavanelli/AudioShare/releases/latest";
     private static final String ACTION_SERVER = "com.audioshare.probe.SERVER";
     private static final String ACTION_CLIENT = "com.audioshare.probe.CLIENT";
     private static final String ACTION_STOP = "com.audioshare.probe.STOP";
@@ -55,6 +66,7 @@ public class MainActivity extends Activity {
     private TextView micLevelLabel;
     private Button serverButton, clientButton, stopButton;
     private final ExecutorService folderExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService updateCheckExecutor = Executors.newSingleThreadExecutor();
     private int folderScanGeneration;
     private TextView instructions;
     private TextView participantsTitle;
@@ -132,6 +144,7 @@ public class MainActivity extends Activity {
     @Override protected void onDestroy() {
         folderScanGeneration++;
         folderExecutor.shutdownNow();
+        updateCheckExecutor.shutdownNow();
         super.onDestroy();
     }
     private void applySavedTheme() {
@@ -722,10 +735,162 @@ public class MainActivity extends Activity {
 
     private void showSettings() {
         new AlertDialog.Builder(this).setTitle("Configurações")
-                .setItems(new String[]{"Selecionar pasta de músicas", "Tema"}, (dialog, which) -> {
-                    if (which == 0) chooseMusicFolder(); else showThemeSettings();
+                .setItems(new String[]{"Selecionar pasta de músicas", "Tema", "Sobre"}, (dialog, which) -> {
+                    if (which == 0) chooseMusicFolder();
+                    else if (which == 1) showThemeSettings();
+                    else showAboutDialog();
                 }).show();
     }
+
+    private void showAboutDialog() {
+        String versionName = "desconhecida";
+        long versionCode = 0;
+        try {
+            android.content.pm.PackageInfo packageInfo = getPackageManager().getPackageInfo(getPackageName(), 0);
+            versionName = packageInfo.versionName == null ? "desconhecida" : packageInfo.versionName;
+            versionCode = Build.VERSION.SDK_INT >= 28 ? packageInfo.getLongVersionCode() : packageInfo.versionCode;
+        } catch (PackageManager.NameNotFoundException ignored) { }
+
+        LinearLayout aboutContent = new LinearLayout(this);
+        aboutContent.setOrientation(LinearLayout.VERTICAL);
+        aboutContent.setPadding(dp(20), dp(8), dp(20), dp(4));
+        TextView appInfo = new TextView(this);
+        appInfo.setText("Áudio Share\nVersão " + versionName + "  •  código " + versionCode
+                + "\nIntercom de voz e música pela rede local.");
+        appInfo.setTextSize(14);
+        aboutContent.addView(appInfo);
+        TextView checkStatus = new TextView(this);
+        checkStatus.setTextSize(13);
+        checkStatus.setPadding(0, dp(14), 0, dp(4));
+        aboutContent.addView(checkStatus);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Sobre o Áudio Share")
+                .setView(aboutContent)
+                .setNegativeButton("Fechar", null)
+                .setNeutralButton("Verificar versão", null)
+                .setPositiveButton("Abrir release", null)
+                .create();
+        dialog.show();
+
+        Button verifyButton = dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
+        Button openReleaseButton = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        String currentVersion = versionName;
+        long lastCheck = getPreferences(MODE_PRIVATE).getLong("release_check_last_attempt", 0L);
+        String savedMessage = getPreferences(MODE_PRIVATE).getString("release_check_message", "A consulta pode ser feita uma vez a cada 24 horas.");
+        checkStatus.setText(savedMessage + getNextCheckText(lastCheck));
+        String savedReleaseUrl = getPreferences(MODE_PRIVATE).getString("release_check_url", "");
+        openReleaseButton.setEnabled(!savedReleaseUrl.isEmpty());
+        openReleaseButton.setOnClickListener(v -> openReleasePage(savedReleaseUrl));
+        verifyButton.setEnabled(isReleaseCheckAvailable(lastCheck));
+        verifyButton.setOnClickListener(v -> checkLatestRelease(currentVersion, checkStatus, verifyButton,
+                openReleaseButton, dialog));
+    }
+
+    private boolean isReleaseCheckAvailable(long lastCheck) {
+        return lastCheck == 0L || System.currentTimeMillis() - lastCheck >= UPDATE_CHECK_INTERVAL_MS;
+    }
+
+    private String getNextCheckText(long lastCheck) {
+        if (isReleaseCheckAvailable(lastCheck)) return "";
+        String nextCheck = new SimpleDateFormat("HH:mm", Locale.getDefault())
+                .format(new Date(lastCheck + UPDATE_CHECK_INTERVAL_MS));
+        return "\nPróxima consulta disponível após " + nextCheck + ".";
+    }
+
+    private void checkLatestRelease(String currentVersion, TextView statusLabel, Button verifyButton,
+                                    Button openButton, AlertDialog dialog) {
+        long lastCheck = getPreferences(MODE_PRIVATE).getLong("release_check_last_attempt", 0L);
+        if (!isReleaseCheckAvailable(lastCheck)) {
+            verifyButton.setEnabled(false);
+            statusLabel.setText("A consulta já foi feita nas últimas 24 horas." + getNextCheckText(lastCheck));
+            return;
+        }
+        long attemptTime = System.currentTimeMillis();
+        getPreferences(MODE_PRIVATE).edit().putLong("release_check_last_attempt", attemptTime).apply();
+        verifyButton.setEnabled(false);
+        openButton.setEnabled(false);
+        statusLabel.setText("Consultando a release mais recente no GitHub…");
+        updateCheckExecutor.execute(() -> {
+            String releaseVersion = null;
+            String releaseUrl = "";
+            String resultMessage;
+            try {
+                JSONObject release = fetchLatestGitHubRelease();
+                releaseVersion = release.optString("tag_name", "").trim();
+                releaseUrl = release.optString("html_url", "").trim();
+                if (releaseVersion.isEmpty()) throw new java.io.IOException("A resposta do GitHub não trouxe a versão da release.");
+                if (releaseUrl.isEmpty()) releaseUrl = "https://github.com/raulpavanelli/AudioShare/releases";
+                resultMessage = compareVersionNames(releaseVersion, currentVersion) > 0
+                        ? "Nova versão " + releaseVersion + " disponível."
+                        : "Não há release mais recente. Última publicada: " + releaseVersion + ".";
+            } catch (Exception error) {
+                resultMessage = "Não foi possível consultar o GitHub: " + error.getMessage();
+            }
+            final String checkedVersion = releaseVersion;
+            final String checkedUrl = releaseUrl;
+            final String message = resultMessage;
+            getPreferences(MODE_PRIVATE).edit()
+                    .putString("release_check_message", message)
+                    .putString("release_check_url", checkedUrl)
+                    .putString("release_check_version", checkedVersion == null ? "" : checkedVersion)
+                    .apply();
+            runOnUiThread(() -> {
+                if (isFinishing() || !dialog.isShowing()) return;
+                statusLabel.setText(message + getNextCheckText(attemptTime));
+                openButton.setEnabled(!checkedUrl.isEmpty());
+                openButton.setOnClickListener(v -> openReleasePage(checkedUrl));
+            });
+        });
+    }
+
+    private JSONObject fetchLatestGitHubRelease() throws Exception {
+        HttpURLConnection connection = null;
+        try {
+            connection = (HttpURLConnection) new URL(GITHUB_LATEST_RELEASE_API).openConnection();
+            connection.setRequestMethod("GET");
+            connection.setConnectTimeout(8000);
+            connection.setReadTimeout(8000);
+            connection.setRequestProperty("Accept", "application/vnd.github+json");
+            connection.setRequestProperty("X-GitHub-Api-Version", "2022-11-28");
+            connection.setRequestProperty("User-Agent", "AudioShare-Android");
+            int responseCode = connection.getResponseCode();
+            if (responseCode != HttpURLConnection.HTTP_OK)
+                throw new java.io.IOException("GitHub respondeu HTTP " + responseCode + ".");
+            StringBuilder response = new StringBuilder();
+            try (InputStream input = connection.getInputStream();
+                 BufferedReader reader = new BufferedReader(new InputStreamReader(input, "UTF-8"))) {
+                String line;
+                while ((line = reader.readLine()) != null) response.append(line);
+            }
+            return new JSONObject(response.toString());
+        } finally {
+            if (connection != null) connection.disconnect();
+        }
+    }
+
+    private int compareVersionNames(String left, String right) {
+        String[] leftParts = left.replaceFirst("^[vV]", "").split("[^0-9]+");
+        String[] rightParts = right.replaceFirst("^[vV]", "").split("[^0-9]+");
+        int count = Math.max(leftParts.length, rightParts.length);
+        for (int i = 0; i < count; i++) {
+            long leftValue = i < leftParts.length ? parseVersionPart(leftParts[i]) : 0L;
+            long rightValue = i < rightParts.length ? parseVersionPart(rightParts[i]) : 0L;
+            if (leftValue != rightValue) return Long.compare(leftValue, rightValue);
+        }
+        return 0;
+    }
+
+    private long parseVersionPart(String part) {
+        try { return Long.parseLong(part); }
+        catch (NumberFormatException ignored) { return 0L; }
+    }
+
+    private void openReleasePage(String url) {
+        try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); }
+        catch (Exception e) { Toast.makeText(this, "Não foi possível abrir a página da release.", Toast.LENGTH_SHORT).show(); }
+    }
+
     private void showThemeSettings() {
         String[] themes = {"Seguir sistema", "Claro", "Escuro"};
         String[] values = {"system", "light", "dark"};

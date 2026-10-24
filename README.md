@@ -2,7 +2,7 @@
 
 Aplicativo Android de intercomunicação por voz em uma rede Wi‑Fi local. Um aparelho inicia como **servidor** e os demais entram como **participantes**. O servidor retransmite o áudio dos participantes, e cada aparelho também envia o próprio microfone. O servidor pode ainda reproduzir uma pasta de músicas e transmitir a música aos participantes.
 
-> Projeto experimental. A versão `1.0.1` reúne melhorias no buffer adaptativo, no reprodutor de músicas e no layout responsivo. É distribuída para instalação direta (sideload) e ainda não está preparada para publicação na Play Store.
+> Projeto experimental. A versão `1.0.2` reúne melhorias no buffer adaptativo, no reprodutor de músicas, no layout responsivo e na consulta de atualizações. É distribuída para instalação direta (sideload) e ainda não está preparada para publicação na Play Store.
 
 ## O que o app faz
 
@@ -12,6 +12,7 @@ Aplicativo Android de intercomunicação por voz em uma rede Wi‑Fi local. Um a
 - Funciona em uma rede Wi‑Fi comum ou em um hotspot, desde que todos os aparelhos estejam na mesma rede e ela permita comunicação entre clientes.
 - Mostra os participantes conectados no servidor e métricas de RTT, perda estimada e buffer adaptativo nos clientes.
 - Mantém o serviço de áudio em primeiro plano enquanto a sessão está ativa.
+- Na opção **Sobre** da engrenagem, mostra a versão instalada e permite consultar manualmente a release pública mais recente do GitHub, no máximo uma vez a cada 24 horas. A consulta abre a página da release; não instala atualizações automaticamente.
 - No servidor, permite escolher uma pasta de músicas pelas configurações, selecionar faixas numa lista e reproduzir, pausar, avançar, voltar e ativar reprodução aleatória.
 - Oferece controles de mídia do Android, incluindo os controles compatíveis de fones e relógios.
 - Ajusta separadamente o ganho da música e o nível da voz enviada por cada aparelho, com medição do nível captado pelo microfone.
@@ -104,7 +105,7 @@ Para gerar um APK Release local de teste:
 
 O Gradle gera `app-release-unsigned.apk`. Assine-o com a chave local de teste antes da instalação. O repositório não inclui a chave privada; uma cópia limpa precisa de uma chave local. A assinatura de teste não deve ser usada numa publicação de produção.
 
-Mantenha o APK final assinado em `app/build/outputs/apk/release/`, com o nome `AudioShare-<versionName>.apk` (por exemplo, `AudioShare-1.0.1.apk`). O arquivo `app-release-unsigned.apk` é a saída original do Gradle e não substitui o APK final assinado. Atualize `versionCode` e `versionName` em `app/build.gradle` ao preparar uma nova versão distribuível.
+Mantenha o APK final assinado em `app/build/outputs/apk/release/`, com o nome `AudioShare-<versionName>.apk` (por exemplo, `AudioShare-1.0.2.apk`). O arquivo `app-release-unsigned.apk` é a saída original do Gradle e não substitui o APK final assinado. Atualize `versionCode` e `versionName` em `app/build.gradle` ao preparar uma nova versão distribuível.
 
 ## Estrutura do projeto
 

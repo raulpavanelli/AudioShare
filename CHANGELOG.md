@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.2 — 2026-10-24
+
+### Adicionado
+
+- Opção **Sobre** nas configurações, com a versão instalada e consulta manual da release pública mais recente no GitHub.
+- Limite local de uma tentativa de consulta a cada 24 horas; a página da release pode ser aberta quando uma versão mais nova está disponível.
+
 ## 1.0.1 — 2026-10-24
 
 ### Adicionado
