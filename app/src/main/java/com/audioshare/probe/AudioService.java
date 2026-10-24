@@ -51,6 +51,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.HashMap;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -67,10 +68,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class AudioService extends Service {
     public static final String ACTION_STATUS = "com.audioshare.probe.STATUS";
+    public static final String ACTION_SERVER_ALREADY_ONLINE = "com.audioshare.probe.SERVER_ALREADY_ONLINE";
     public static final String ACTION_SERVER = "com.audioshare.probe.SERVER";
     public static final String ACTION_CLIENT = "com.audioshare.probe.CLIENT";
     public static final String ACTION_STOP = "com.audioshare.probe.STOP";
     public static final String ACTION_MUSIC_SET_PLAYLIST = "com.audioshare.probe.MUSIC_SET_PLAYLIST";
+    public static final String ACTION_MUSIC_SELECT_TRACK = "com.audioshare.probe.MUSIC_SELECT_TRACK";
     public static final String ACTION_MUSIC_PLAY = "com.audioshare.probe.MUSIC_PLAY";
     public static final String ACTION_MUSIC_PAUSE = "com.audioshare.probe.MUSIC_PAUSE";
     public static final String ACTION_MUSIC_NEXT = "com.audioshare.probe.MUSIC_NEXT";
@@ -102,17 +105,19 @@ public class AudioService extends Service {
     private static volatile int participantCount = 0;
     private static volatile String currentParticipants = "Nenhum aparelho conectado";
     private static volatile boolean musicActive;
-    private static volatile int musicSendVolume = 80;
+    private static volatile float musicSendVolume = 2.5f;
     private static volatile int voiceSendGain = 100;
-    private static volatile boolean musicShuffle;
+    private static volatile boolean musicShuffle = true;
     private static volatile String musicTrackTitle = "Nenhuma música selecionada";
     private static volatile AudioService activeInstance;
 
     private final ExecutorService io = Executors.newCachedThreadPool();
     private final Map<Integer, Peer> peers = new ConcurrentHashMap<>();
-    private final Map<Integer, AudioTrack> tracks = new ConcurrentHashMap<>();
+    private final Map<Integer, AdaptivePlayback> playbackBuffers = new ConcurrentHashMap<>();
+    private final Map<Integer, AtomicInteger> fallbackAudioSequences = new ConcurrentHashMap<>();
     private final AtomicInteger nextPeerId = new AtomicInteger(1);
     private volatile boolean running;
+    private final AtomicInteger startRequestGeneration = new AtomicInteger();
     private volatile int localPeerId;
     private volatile Socket clientSocket;
     private volatile DataOutputStream clientOutput;
@@ -157,6 +162,8 @@ public class AudioService extends Service {
     private static final AtomicInteger rttMillis = new AtomicInteger(-1);
     private static final AtomicLong receivedAudioPackets = new AtomicLong();
     private static final AtomicLong lostAudioPackets = new AtomicLong();
+    private static volatile int micLevelDbfs = -90;
+    private static volatile int adaptiveBufferMillis = 50;
     private final Map<Integer, Integer> lastReceivedSequence = new ConcurrentHashMap<>();
     private final Map<Integer, Long> pendingPings = new ConcurrentHashMap<>();
     private final AtomicInteger musicSequence = new AtomicInteger();
@@ -190,17 +197,19 @@ public class AudioService extends Service {
         String rtt = rttMillis.get() < 0 ? "medindo…" : rttMillis.get() + " ms";
         String loss = received + lost == 0 ? "medindo…" : String.format(java.util.Locale.US, "%.1f%%", (lost * 100.0) / (received + lost));
         return "RTT até o servidor: " + rtt + "\nPerda estimada de áudio: " + loss
+                + "\nBuffer adaptativo: " + adaptiveBufferMillis + " ms"
                 + "\nPacotes recebidos: " + received;
     }
 
     public static boolean isMusicActive() { return musicActive; }
     public static boolean isMusicShuffle() { return musicShuffle; }
     public static String getMusicTrackTitle() { return musicTrackTitle; }
-    public static int getMusicSendVolume() { return musicSendVolume; }
+    public static float getMusicSendVolume() { return musicSendVolume; }
     public static int getVoiceSendGain() { return voiceSendGain; }
+    public static String getMicLevelDescription() { return "Nível captado pelo microfone: " + micLevelDbfs + " dBFS"; }
     public static void setVoiceSendGain(int gain) { voiceSendGain = Math.max(0, Math.min(200, gain)); }
-    public static void setMusicSendVolume(int volume) {
-        musicSendVolume = Math.max(0, Math.min(100, volume));
+    public static void setMusicSendVolume(float volume) {
+        musicSendVolume = Math.max(0f, Math.min(25f, volume));
         AudioService service = activeInstance;
         if (service != null) service.applyMusicVolume();
     }
@@ -217,6 +226,11 @@ public class AudioService extends Service {
         if (ACTION_MUSIC_SET_PLAYLIST.equals(action)) {
             ArrayList<Uri> uris = intent.getParcelableArrayListExtra("musicUris");
             setMusicPlaylist(uris == null ? new ArrayList<>() : uris);
+            return START_STICKY;
+        }
+        if (ACTION_MUSIC_SELECT_TRACK.equals(action)) {
+            if (intent != null && currentMode == MODE_SERVER)
+                startMusicTrack(intent.getIntExtra("trackIndex", -1));
             return START_STICKY;
         }
         if (ACTION_MUSIC_PLAY.equals(action)) {
@@ -243,21 +257,61 @@ public class AudioService extends Service {
             return START_STICKY;
         }
         if (ACTION_STOP.equals(action)) {
+            startRequestGeneration.incrementAndGet();
             stopSession();
             stopForeground(true);
             stopSelf();
             return START_NOT_STICKY;
         }
         int requestedMode = ACTION_CLIENT.equals(action) ? MODE_CLIENT : MODE_SERVER;
-        if (requestedMode == MODE_SERVER && intent != null && intent.hasExtra("musicUris")) {
-            ArrayList<Uri> uris = intent.getParcelableArrayListExtra("musicUris");
-            setMusicPlaylist(uris == null ? new ArrayList<>() : uris);
+        if (requestedMode == MODE_SERVER && running && currentMode == MODE_SERVER) {
+            setStatus("Este aparelho já está ativo como servidor.");
+            return START_STICKY;
         }
-        startForegroundCompat(buildNotification("Preparando áudio local"));
-        startSession(requestedMode);
+        final int requestGeneration = startRequestGeneration.incrementAndGet();
+        final ArrayList<Uri> requestedPlaylist = requestedMode == MODE_SERVER && intent != null
+                && intent.hasExtra("musicUris") ? intent.getParcelableArrayListExtra("musicUris") : null;
+        startForegroundCompat(buildNotification(requestedMode == MODE_SERVER
+                ? "Verificando servidor na rede" : "Preparando áudio local"));
+        if (requestedMode == MODE_SERVER) {
+            io.execute(() -> {
+                if (requestGeneration != startRequestGeneration.get()) return;
+                boolean existingServer = findActiveServerOnWifi();
+                if (requestGeneration != startRequestGeneration.get()) return;
+                if (existingServer) {
+                    Log.i(TAG, "Server start rejected: another AudioShare server is already online");
+                    if (!running || currentMode == MODE_STOPPED) {
+                        setStatus("Já existe um servidor ativo nesta rede.");
+                        Intent notice = new Intent(ACTION_SERVER_ALREADY_ONLINE).setPackage(getPackageName());
+                        sendBroadcast(notice);
+                        stopForeground(true);
+                        stopSelf(startId);
+                    } else {
+                        setStatus("Já existe um servidor ativo nesta rede. Este aparelho continuou como participante.");
+                        Intent notice = new Intent(ACTION_SERVER_ALREADY_ONLINE).setPackage(getPackageName());
+                        sendBroadcast(notice);
+                    }
+                    return;
+                }
+                if (requestedPlaylist != null) setMusicPlaylist(requestedPlaylist);
+                if (requestGeneration == startRequestGeneration.get()) startSession(MODE_SERVER);
+            });
+        } else {
+            startSession(MODE_CLIENT);
+        }
         return START_STICKY;
     }
 
+    private boolean findActiveServerOnWifi() {
+        for (Network network : findWifiNetworks()) {
+            try {
+                if (discoverServer(network) != null) return true;
+            } catch (IOException e) {
+                Log.i(TAG, "Server preflight discovery failed on " + network + ": " + e.getMessage());
+            }
+        }
+        return false;
+    }
     private void startForegroundCompat(Notification notification) {
         if (Build.VERSION.SDK_INT >= 29) {
             int types = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
@@ -270,12 +324,23 @@ public class AudioService extends Service {
     }
 
     private synchronized void setMusicPlaylist(List<Uri> uris) {
-        stopMusicPlayerInternal(true);
-        musicPlaylist.clear();
-        if (uris != null) musicPlaylist.addAll(uris);
-        musicTrackIndex = 0;
-        musicTrackTitle = musicPlaylist.isEmpty() ? "Nenhuma música na pasta selecionada" : getTrackTitle(musicPlaylist.get(0));
-        currentStatus = musicPlaylist.isEmpty() ? "Selecione uma pasta com músicas no servidor." : "Pasta carregada: " + musicPlaylist.size() + " faixas.";
+        Uri playingUri = musicPlayer != null && musicTrackIndex >= 0 && musicTrackIndex < musicPlaylist.size()
+                ? musicPlaylist.get(musicTrackIndex) : null;
+        ArrayList<Uri> updated = new ArrayList<>();
+        if (uris != null) updated.addAll(uris);
+        int preservedIndex = playingUri == null ? -1 : updated.indexOf(playingUri);
+        if (preservedIndex >= 0) {
+            musicPlaylist.clear();
+            musicPlaylist.addAll(updated);
+            musicTrackIndex = preservedIndex;
+        } else {
+            stopMusicPlayerInternal(true);
+            musicPlaylist.clear();
+            musicPlaylist.addAll(updated);
+            musicTrackIndex = 0;
+            musicTrackTitle = musicPlaylist.isEmpty() ? "Nenhuma música na pasta selecionada" : getTrackTitle(musicPlaylist.get(0));
+            currentStatus = musicPlaylist.isEmpty() ? "Selecione uma pasta com músicas no servidor." : "Pasta carregada: " + musicPlaylist.size() + " faixas.";
+        }
         updateMusicSession();
         sendStatus();
     }
@@ -377,7 +442,7 @@ public class AudioService extends Service {
 
     private void startMusicStreamer(Uri uri, long generation) {
         MusicStreamer streamer = new MusicStreamer(this, uri, new MusicStreamer.Listener() {
-            @Override public int getVolume() { return musicSendVolume; }
+            @Override public float getVolume() { return musicSendVolume; }
             @Override public void onFrame(byte[] pcm, int length) {
                 if (generation == musicGeneration && musicActive && currentMode == MODE_SERVER)
                     sendUdpAudio(serverAudioSocket, MUSIC_SOURCE_ID, musicSequence.getAndIncrement(), pcm, length,
@@ -644,6 +709,7 @@ public class AudioService extends Service {
                 if (n > 0) {
                     if ((n & 1) != 0) n--;
                     if (n > 0) {
+                        micLevelDbfs = calculateMicLevelDbfs(pcm, n);
                         applyVoiceSendGain(pcm, n, voiceSendGain);
                         sendAudio(pcm, n);
                     }
@@ -661,6 +727,19 @@ public class AudioService extends Service {
         }
     }
 
+    private static int calculateMicLevelDbfs(byte[] pcm, int length) {
+        long sumSquares = 0;
+        int samples = 0;
+        for (int i = 0; i + 1 < length; i += 2) {
+            int sample = (short) ((pcm[i] & 0xff) | ((pcm[i + 1] & 0xff) << 8));
+            sumSquares += (long) sample * sample;
+            samples++;
+        }
+        if (samples == 0) return -90;
+        double rms = Math.sqrt(sumSquares / (double) samples);
+        if (rms < 1) return -90;
+        return Math.max(-90, Math.min(0, (int) Math.round(20.0 * Math.log10(rms / 32768.0))));
+    }
     private static void applyVoiceSendGain(byte[] pcm, int length, int gainPercent) {
         if (gainPercent == 100) return;
         float gain = gainPercent / 100f;
@@ -801,7 +880,7 @@ public class AudioService extends Service {
                     if (destination.id != sourceId && destination.udpAddress != null)
                         socket.send(new DatagramPacket(packet.getData(), packet.getOffset(), packet.getLength(), destination.udpAddress));
                 }
-                playAudio(sourceId, data, length);
+                playAudio(sourceId, sequence, data, length);
             }
         } catch (SocketException e) {
             if (running) setStatus("Falha ao abrir o canal de áudio UDP: " + e.getMessage());
@@ -962,7 +1041,7 @@ public class AudioService extends Service {
                 receivedAudioPackets.incrementAndGet();
                 byte[] data = new byte[length];
                 frame.get(data);
-                playAudio(sourceId, data, length);
+                playAudio(sourceId, sequence, data, length);
             }
         } catch (SocketException e) {
             if (running && currentMode == MODE_CLIENT) Log.i(TAG, "UDP audio receiver closed");
@@ -1164,41 +1243,257 @@ public class AudioService extends Service {
     }
 
     private void playAudio(int sourceId, byte[] data, int length) {
-        if (length == 0) return;
+        AtomicInteger sequence = fallbackAudioSequences.computeIfAbsent(sourceId, ignored -> new AtomicInteger());
+        playAudio(sourceId, sequence.getAndIncrement(), data, length);
+    }
+
+    private void playAudio(int sourceId, int sequence, byte[] data, int length) {
+        if (length <= 0) return;
         try {
-            AudioTrack track = tracks.get(sourceId);
-            if (track == null) {
-                AudioAttributes attributes = new AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build();
-                AudioFormat format = new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(SAMPLE_RATE).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build();
-                int min = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
-                int bufferBytes = Math.max(min, FRAME_BYTES * 2);
-                AudioTrack.Builder builder = new AudioTrack.Builder().setAudioAttributes(attributes).setAudioFormat(format)
-                        .setBufferSizeInBytes(bufferBytes)
-                        .setTransferMode(AudioTrack.MODE_STREAM);
-                if (Build.VERSION.SDK_INT >= 26) builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY);
-                track = builder.build();
-                if (Build.VERSION.SDK_INT >= 24) {
-                int effectiveFrames = track.setBufferSizeInFrames(FRAME_SAMPLES * 2);
-                    Log.i(TAG, "AudioTrack low-latency buffer=" + effectiveFrames + " frames ("
-                            + (effectiveFrames * 1000 / SAMPLE_RATE) + " ms), mode=" + track.getPerformanceMode());
-                }
-                track.play();
-                AudioTrack previous = tracks.putIfAbsent(sourceId, track);
+            AdaptivePlayback playback = playbackBuffers.get(sourceId);
+            if (playback == null) {
+                AdaptivePlayback candidate = new AdaptivePlayback(sourceId);
+                AdaptivePlayback previous = playbackBuffers.putIfAbsent(sourceId, candidate);
                 if (previous != null) {
-                    track.release();
-                    track = previous;
+                    candidate.close();
+                    playback = previous;
+                } else {
+                    playback = candidate;
+                    playback.start();
                 }
             }
-            track.write(data, 0, length, AudioTrack.WRITE_BLOCKING);
+            playback.offer(sequence, data, length);
         } catch (Exception e) {
-            Log.w(TAG, "Audio playback failed", e);
+            Log.w(TAG, "Adaptive audio playback failed for source " + sourceId, e);
             releaseTrack(sourceId);
         }
     }
 
+    private void refreshAdaptiveBufferMetric() {
+        int maximum = FRAME_MILLIS * MIN_BUFFER_FRAMES;
+        for (AdaptivePlayback playback : playbackBuffers.values()) {
+            maximum = Math.max(maximum, playback.getBufferMillis());
+        }
+        adaptiveBufferMillis = maximum;
+    }
+
+    private static final int FRAME_MILLIS = 25;
+    private static final int MIN_BUFFER_FRAMES = 2;
+    private static final int MAX_BUFFER_FRAMES = 8;
+
+    private final class AdaptivePlayback implements Runnable {
+        private final int sourceId;
+        private final AudioTrack track;
+        private final Map<Integer, byte[]> queued = new HashMap<>();
+        private volatile boolean active = true;
+        private volatile int targetFrames = MIN_BUFFER_FRAMES;
+        private Thread worker;
+        private boolean hasSequence;
+        private boolean started;
+        private boolean buffering;
+        private int expectedSequence;
+        private int latestSequence;
+        private long lastArrivalMs;
+        private long lastAdjustmentMs;
+        private long missingSinceMs;
+        private double jitterMs;
+        private int concealedFrames;
+        private byte[] lastFrame;
+
+        AdaptivePlayback(int sourceId) {
+            this.sourceId = sourceId;
+            AudioAttributes attributes = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build();
+            AudioFormat format = new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(SAMPLE_RATE).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build();
+            int min = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT);
+            AudioTrack.Builder builder = new AudioTrack.Builder().setAudioAttributes(attributes).setAudioFormat(format)
+                    .setBufferSizeInBytes(Math.max(min, FRAME_BYTES))
+                    .setTransferMode(AudioTrack.MODE_STREAM);
+            if (Build.VERSION.SDK_INT >= 26) builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY);
+            track = builder.build();
+            if (Build.VERSION.SDK_INT >= 24) {
+                int frames = track.setBufferSizeInFrames(FRAME_SAMPLES);
+                Log.i(TAG, "AudioTrack source=" + sourceId + " hardware buffer=" + frames + " frames");
+            }
+            track.play();
+        }
+
+        void start() {
+            worker = new Thread(this, "AudioShare-playback-" + sourceId);
+            worker.setDaemon(true);
+            worker.start();
+        }
+
+        synchronized void offer(int sequence, byte[] data, int length) {
+            if (!active || length <= 0) return;
+            long now = SystemClock.elapsedRealtime();
+            if (!hasSequence) {
+                hasSequence = true;
+                expectedSequence = sequence;
+                latestSequence = sequence;
+                lastArrivalMs = now;
+            } else {
+                int step = sequence - latestSequence;
+                if (step > 0) {
+                    if (step < 1000) {
+                        long expectedMs = (long) step * FRAME_MILLIS;
+                        long deviation = Math.abs((now - lastArrivalMs) - expectedMs);
+                        jitterMs = (jitterMs * 0.8) + (deviation * 0.2);
+                        int jitterTarget = Math.min(MAX_BUFFER_FRAMES,
+                                MIN_BUFFER_FRAMES + (int) Math.ceil(jitterMs / FRAME_MILLIS));
+                        if (jitterTarget > targetFrames) increaseTarget(jitterTarget, now);
+                    } else {
+                        increaseTarget(Math.min(MAX_BUFFER_FRAMES, targetFrames + 2), now);
+                    }
+                    latestSequence = sequence;
+                    lastArrivalMs = now;
+                    if (step > 1) increaseTarget(Math.min(MAX_BUFFER_FRAMES, targetFrames + Math.min(2, step - 1)), now);
+                }
+            }
+            int offset = sequence - expectedSequence;
+            if (offset < 0) return;
+            if (offset > MAX_BUFFER_FRAMES * 4) {
+                queued.clear();
+                expectedSequence = sequence;
+                started = false;
+                buffering = false;
+                missingSinceMs = 0;
+                concealedFrames = 0;
+                lastFrame = null;
+            }
+            if (queued.containsKey(sequence)) return;
+            byte[] copy = new byte[length];
+            System.arraycopy(data, 0, copy, 0, length);
+            queued.put(sequence, copy);
+            notifyAll();
+        }
+
+        private void increaseTarget(int frames, long now) {
+            if (frames > targetFrames) {
+                targetFrames = Math.min(MAX_BUFFER_FRAMES, frames);
+                if (started) buffering = true;
+                lastAdjustmentMs = now;
+                Log.i(TAG, "Adaptive buffer source=" + sourceId + " increased to " + getBufferMillis() + " ms");
+                refreshAdaptiveBufferMetric();
+                sendStatus();
+            }
+        }
+
+        int getBufferMillis() { return targetFrames * FRAME_MILLIS; }
+
+        @Override public void run() {
+            while (active) {
+                byte[] frame = null;
+                synchronized (this) {
+                    long now = SystemClock.elapsedRealtime();
+                    if (!started) {
+                        if (queued.size() >= targetFrames) started = true;
+                        else { waitForPacket(20); continue; }
+                    }
+                    boolean concealmentOnly = false;
+                    if (buffering) {
+                        if (queued.size() >= targetFrames) buffering = false;
+                        else {
+                            concealedFrames++;
+                            frame = makeConcealmentFrame();
+                            concealmentOnly = true;
+                        }
+                    }
+                    if (frame == null && !buffering) {
+                        frame = queued.remove(expectedSequence);
+                        if (frame != null) {
+                            expectedSequence++;
+                            missingSinceMs = 0;
+                            concealedFrames = 0;
+                            lastFrame = frame;
+                        } else if (hasFuturePacket()) {
+                            if (missingSinceMs == 0) missingSinceMs = now;
+                            if (now - missingSinceMs < 10) { waitForPacket(4); continue; }
+                            expectedSequence++;
+                            missingSinceMs = 0;
+                            concealedFrames++;
+                            frame = makeConcealmentFrame();
+                            concealmentOnly = true;
+                        } else {
+                            if (queued.isEmpty() && targetFrames > MIN_BUFFER_FRAMES && now - lastArrivalMs > 8000) {
+                                targetFrames = MIN_BUFFER_FRAMES;
+                                started = false;
+                                buffering = false;
+                                lastAdjustmentMs = now;
+                                jitterMs = 0;
+                                Log.i(TAG, "Adaptive buffer source=" + sourceId + " reset to " + getBufferMillis() + " ms after idle");
+                                refreshAdaptiveBufferMetric();
+                                sendStatus();
+                            }
+                            waitForPacket(20);
+                            continue;
+                        }
+                    }
+                    if (!concealmentOnly && targetFrames > MIN_BUFFER_FRAMES && now - lastAdjustmentMs > 8000) {
+                        byte[] quietFrame = queued.get(expectedSequence);
+                        if (quietFrame != null && isQuietFrame(quietFrame)) {
+                            queued.remove(expectedSequence);
+                            expectedSequence++;
+                            targetFrames--;
+                            lastAdjustmentMs = now;
+                            jitterMs *= 0.5;
+                            Log.i(TAG, "Adaptive buffer source=" + sourceId + " reduced to " + getBufferMillis() + " ms");
+                            refreshAdaptiveBufferMetric();
+                            sendStatus();
+                        }
+                    }
+                }
+                if (frame != null && active) {
+                    int written = track.write(frame, 0, frame.length, AudioTrack.WRITE_BLOCKING);
+                    if (written < 0 && active) Log.w(TAG, "AudioTrack write failed: " + written);
+                }
+            }
+        }
+
+        private boolean hasFuturePacket() {
+            for (Integer sequence : queued.keySet()) if (sequence - expectedSequence > 0) return true;
+            return false;
+        }
+
+        private boolean isQuietFrame(byte[] frame) {
+            long absoluteSum = 0;
+            int samples = frame.length / 2;
+            for (int i = 0; i + 1 < frame.length; i += 2) {
+                int sample = (short) ((frame[i] & 0xff) | (frame[i + 1] << 8));
+                absoluteSum += Math.abs(sample);
+            }
+            return samples == 0 || absoluteSum / samples < 650;
+        }
+        private byte[] makeConcealmentFrame() {
+            byte[] concealed = new byte[FRAME_BYTES];
+            if (lastFrame == null) return concealed;
+            float gain = concealedFrames > 4 ? 0f : (float) Math.pow(0.72, concealedFrames);
+            int count = Math.min(lastFrame.length, concealed.length);
+            for (int i = 0; i + 1 < count; i += 2) {
+                int sample = (short) ((lastFrame[i] & 0xff) | (lastFrame[i + 1] << 8));
+                int faded = Math.round(sample * gain);
+                concealed[i] = (byte) faded;
+                concealed[i + 1] = (byte) (faded >> 8);
+            }
+            return concealed;
+        }
+
+        private void waitForPacket(long millis) {
+            try { wait(millis); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        }
+
+        void close() {
+            active = false;
+            synchronized (this) { notifyAll(); }
+            if (worker != null) worker.interrupt();
+            try { track.pause(); } catch (Exception ignored) { }
+            try { track.flush(); } catch (Exception ignored) { }
+            try { track.release(); } catch (Exception ignored) { }
+        }
+    }
     private void sendFrame(Peer peer, int type, int sourceId, byte[] data, int length) {
         synchronized (peer.writeLock) {
             try {
@@ -1227,16 +1522,14 @@ public class AudioService extends Service {
     }
 
     private void releaseTrack(int id) {
-        AudioTrack track = tracks.remove(id);
-        if (track != null) {
-            try { track.pause(); } catch (Exception ignored) { }
-            try { track.flush(); } catch (Exception ignored) { }
-            try { track.release(); } catch (Exception ignored) { }
-        }
+        AdaptivePlayback playback = playbackBuffers.remove(id);
+        if (playback != null) playback.close();
+        fallbackAudioSequences.remove(id);
+        refreshAdaptiveBufferMetric();
     }
 
     private void releaseAllTracks() {
-        for (Integer id : tracks.keySet()) releaseTrack(id);
+        for (Integer id : playbackBuffers.keySet()) releaseTrack(id);
     }
 
     private void setStatus(String value) {

@@ -16,7 +16,7 @@ import java.nio.ByteOrder;
 /** Decodes the selected track and sends paced 25 ms mono frames to the intercom peers. */
 final class MusicStreamer implements Runnable {
     interface Listener {
-        int getVolume();
+        float getVolume();
         void onFrame(byte[] pcm, int length);
         void onEnded();
         void onError(String message, Exception error);
@@ -185,8 +185,8 @@ final class MusicStreamer implements Runnable {
                 sampleCount++;
                 resamplePhase += OUTPUT_RATE;
                 while (resamplePhase >= sampleRate) {
-                    int volume = listener.getVolume();
-                    int scaled = (int) (sampleSum / Math.max(1, sampleCount)) * volume / 100;
+                    float volume = listener.getVolume();
+                    int scaled = Math.round((sampleSum / (float) Math.max(1, sampleCount)) * volume / 100f);
                     short output = (short) Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, scaled));
                     append(output);
                     resamplePhase -= sampleRate;
